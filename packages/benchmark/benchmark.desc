@@ -1,0 +1,2 @@
+# Preserve the pack's menu, support files and MARKS directory under C:\BENCH.
+"." "C:BENCH/"

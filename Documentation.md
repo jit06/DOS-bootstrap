@@ -1,296 +1,192 @@
-# Full documentation for Emu68-Boostrap
+# DOS-bootstrap documentation
 
-- [Full documentation for Emu68-Boostrap](#full-documentation-for-emu68-boostrap)
-  - [Initialize disk and Amiga partitions](#initialize-disk-and-amiga-partitions)
-    - [Arguments \& Options](#arguments--options)
-    - [Usage Example](#usage-example)
-  - [Install Amiga software](#install-amiga-software)
-    - [Layered Package System](#layered-package-system)
-    - [Arguments \& Options](#arguments--options-1)
-    - [Usage Example](#usage-example-1)
-    - [Icons operations with ".icons" files](#icons-operations-with-icons-files)
-      - [Icon types reference](#icon-types-reference)
-    - [Post processing script](#Post-processing-script)
-  - [Creating packages](#creating-packages)
-    - [Arguments \& Options](#arguments--options-2)
-    - [Usage Example](#usage-example-2)
-  - [Configuration Files Format](#configuration-files-format)
-    - [Package list file](#package-list-file)
-    - [Package Description](#package-description)
+- [DOS-bootstrap documentation](#dos-bootstrap-documentation)
+  - [Initialize a disk or raw image](#initialize-a-disk-or-raw-image)
+  - [Generic package workflow](#generic-package-workflow)
+    - [Package lists and sources](#package-lists-and-sources)
+    - [Generate and edit descriptions](#generate-and-edit-descriptions)
+    - [Install packages](#install-packages)
+    - [MS-DOS 6.22 installation](#ms-dos-622-installation)
+    - [Benchmark pack](#benchmark-pack)
 
 
-## Initialize disk and Amiga partitions
+## Initialize a disk or raw image
 
-The `setup_disk.sh` script is responsible for the low-level preparation of the storage medium. It automates the creation of a hybrid partition structure compatible with both the host hardware (via MBR) and the Amiga environment (via RDB).
+For isolated BIOS boot and disk-read troubleshooting, see the [standalone boot diagnostics](diagnostics/README.md). These are separate from normal disk and package installation.
 
-Beware, some integrated sdcard reader (eg. in laptop) expose something like/dev/mmcblk0 but does not support low level IOCTL, making hst-imager unable to create Amiga partitions. 
+`setup_disk.sh` creates a DOS/MBR partition table, writes generic Syslinux MBR boot code, and formats FAT16 primary partitions. It does not install an operating system or a DOS-specific volume boot record; its output is not yet a bootable MS-DOS installation. **All existing data on the selected target will be destroyed.**
 
->**note**: it is possible to use a file instead of a real device.
-
-**Key actions done by the script:**
-
-1. **Hybrid Partitioning**: Creates an MBR table with two primary partitions:
-    - **FAT32 Partition**: Dedicated to Emu68 firmware and boot files.
-    - **Type 0x76 Partition**: A container for the Amiga Rigid Disk Block (RDB), which allows for native Amiga partitions
-        > **Note**: all emu68-boostrap scripts have the same partition naming convention : "Workbench" for the OS and all the addons, "Apps" for applications and "Games" obsviously for games.
-
-2. **Dynamic Configuration**: The partitioning process relies on a `partitions.config` file using the **hst.imager** script format.
-
-    > **Note**: The placeholder `[PATH_TO_DISK]` within this file is automatically replaced at runtime by the disk path provided in the arguments.
-
-3. **Emu68 Installation**: Downloads the latest firmware, installs the provided Kickstart ROM, and handles optional custom `config.txt` or `cmdline.txt` files.
-
-4. **Filesystem Setup**: Prepares the RDB structure and installs necessary Amiga filesystems like `pfs3aio` (the only one tested and provided)
-
-### Arguments & Options
-
-| Argument | Long Format        | Description                                                   |
-| :------- | :----------------- | :------------------------------------------------------------ |
-| `-d`     | `--disk`           | **Required**. Path to the disk device (e.g., `/dev/sdc`).     |
-| `-k`     | `--kickstart`      | **Required**. Path to the Amiga Kickstart ROM file.           |
-| `-c`     | `--config`         | Path to a custom `config.txt` for Emu68.                      |
-| `-l`     | `--cmdline`        | Path to a custom `cmdline.txt` for Emu68.                     |
-|          | `--clean-on-close` | Removes temporary downloads and extractions after completion. |
-| `-h`     | `--help`           | Displays the help message.                                    |
-
-### Usage Example
+Install the host commands `sfdisk`, `mkfs.fat`, and `ms-sys` (the latter must support `--mbrsyslinux`), together with the standard Linux utilities checked by the script. `ms-sys` is a normal host dependency; it is not downloaded or compiled by the project. Run as root for a block device; regular raw images can be prepared without root if writable.
 
 ```bash
-./setup_disk.sh -d /dev/sdc -k ./roms/kick32.rom --clean-on-close
+# Create a disposable image, then initialize it:
+truncate -s 512M disk.img
+./setup_disk.sh --disk disk.img
+
+# A physical whole disk requires interactive confirmation of its full path:
+sudo ./setup_disk.sh --disk /dev/sdX --config partitions.config
 ```
 
-If the device is an image that you want to test with an emulator, you may need to use loop device instead of the file, as it contains a partition scheme.
-The example below will generate a 16Gb image, prepare it and create something like `/dev/loop0p1` and `/dev/loop0p2`. The entry /dev/loop0p2 contains the Amiga RDB definition, thus it can be used in an emulator (eg. Amiberry). You may need to use "hardfile" and not "hardrive".
+Use `--help` for options. The target image must already exist. Physical disks must be whole devices with 512-byte logical sectors and must not be mounted, in use as swap, or held by another block device. Images attached to a loop device are rejected. Targets must have an even number of sectors: `mkfs.fat` can otherwise write an incorrect FAT total-sector count when formatting at an offset. The script validates the configuration and displays the resolved layout before writing; a physical disk additionally requires the full resolved path to be typed at the prompt. Do not use a disk containing data you need.
 
-```bash
-dd if=/dev/zero of=/path/to/amigadisk.img bs=1M count=16384 
-./setup_disk.sh -d /path/to/amigadisk.img -k ./roms/kick32.rom --clean-on-close
-sudo losetup -fP /path/to/amigadisk.img 
-
-```
-
-## Install Amiga software
-
-The `package.sh` script handles the deployment of softwares to the Amiga partitions using a sort of package mecanism. Instead of copying files one by one (which is extremely slow on RDB structures), it reconstructs the entire file tree in a local **staging area** on `/tmp` before performing a bulk transfer to the amiga partitions.
-
-**Key features:**
-
-- **Flexible Sourcing**: Supports local archives or direct downloads via HTTP/HTTPS.
-- **Smart Extraction**: Automatically handles `.lha`, `.zip`, `.iso` and `.adf` files, including `.z` decompression inside ADF (gunzip).
-- **Encoding Bridge**: Converts package descriptions and filenames from Linux (UTF-8) to Amiga (ISO-8859-1) to ensure accents and special characters appear correctly on the Workbench.
-- **Volume Mapping**: Allows you to map virtual Amiga volume names (e.g., `Workbench:`) to physical RDB device names (e.g., `SDH0`) defined on your disk.
-- **Bulk Transfer**: Uses **hst.imager** to copy entire directories to the RDB corresponding Amiag partitions.
-
-### Layered Package System
-
-The deployment follows a **top-down priority** based on your package list. Software are installed in the exact order specified in the `.list` file, overwriting any existing files in the staging area.
-
-- **Standardized Repository**: By default, the script looks into `packages` directory where `.list` files and their associated folders are stored. Each folder contains one `.desc` file per line in the `.list` file.
-- **Multi-Package Installation**: You can chain multiple package sets (e.g., `OS32,Addons`) in a single command. They will be processed in the order provided.
-- **Customizable & Layered**: You can easily add or reorder software. For example, installing a "GlowIcons" package after the main OS will automatically overwrite the standard icons in the staging area.
-- **Pre-configured Packages**: Several ready-to-use sets are available in the `packages` folder.
-
-### Arguments & Options
-
-| Argument | Long Format        | Description                                                                                                                                   |
-| :------- | :----------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- |
-| **`-i`** | **`--install`**    | **Required (or -l/-p)**. Names of packages to install (e.g., `OS32,Addons`). Matches `.list` files and directories in the `packages/` folder. |
-| `-l`     | `--package-list`   | **Manual Mode**. Path to a specific `.list` file.                                                                                             |
-| `-p`     | `--packages-path`  | **Manual Mode**. Directory containing the associated `.desc` files.                                                                           |
-| `-d`     | `--disk`           | **Required**. Path to the physical disk (e.g., `/dev/sdc`).                                                                                   |
-| `-m`     | `--mapping`        | Map an RDB Device to a Volume Name (e.g., `-m SDH0=Workbench`). Can be used multiple times.                                                   |
-|          | `--clean-on-close` | Removes downloads and extraction folders after completion.                                                                                    |
-| `-h`     | `--help`           | Displays the help message.                                                                                                                    |
-
-> **Warning**: The `--install` argument is mutually exclusive with `--package-list` and `--packages-path`.
-
-### Usage Example
-
-**Standard Usage (Automated):**
-Install the OS 3.2 base followed by the Addons pack using the standardized repository:
-
-```bash
-sudo ./package.sh -d /dev/sdc --install OS32,Addons -m SDH0=Workbench
-```
-
-**Custom package file (Manual):**
-
-```bash
-sudo ./package.sh -d /dev/sdc -l my-own-packages.list -p my-own-packages-folder -m SDH0=Workbench 
-```
-
-> **Note 1**: any `.user-startup` file will be injected in system partition `S/User-startup` and will automatically be surrounded by `;BEGIN <package name>` and `;END <package name>`
-
-> **Note 2**: any `.icons` file will be used to set various icons properties like on the real workbench, see next chapter.
-
-### Icons operations with ".icons" files
-
-Any package can be associated with a ".icons" file which contains orders passed through to `hst.amiga` command. The goal is to change various icon informations like type and position in the staging area. It allows to customize any icons before copying files to the final destination.
-
-**The file format is basicaly :**
-
-```bash
-<Amiga style path to the .info file> <hst.amiga icon order> <hst.amiga command arguments>
-```
-
-**Example :**
-
-giving a package with the following `StandardGlowIcons.desc` that install a specific disk icon to the workbench partition:
-
-```bash
-"StandardGlowIcons/Drives/Harddrive/AmigaHDisk.info" "Workbench:disk.info"
-```
-
-You can then use the following `StandardGlowIcons.icons` file to set the icon type to `1` (`disk`), set its position to `20,50` and makes it open a window with dimensions 465x164 on position `80`,`50`
-
-```bash
-"Workbench:disk.info"   update -t 1 -x 20 -y 50 -dx 80 -dy 50 -dw 465 -dh 165
-```
-
-It is also possible to set tooltypes. In that case, the `newmeter.tooltypes` is a simple text file which is on the same directory as the .icons file
-```bash
-"Workbench:Tools/Commodities/NewMeter.info" tooltypes import newmeter.tooltypes
-```
-
-#### Icon types reference
-
-- **1**: disk
-- **2**: drawer
-- **3**: tool
-- **4**: project
-- **5**: trashcan
-- **7**: kickstart
-- **8**: appicon
-
-### Post processing script
-
-The parameters `--post-script` or `-s` of the `package.sh` command allows to do any post processing on the staging area, just before the copy to the final destination. The given script is executed in the staging directory, any Amiga partition are just folders.
-
-The script is also executed with a `context` that provides several variables and functions (defined in `library.sh`) which should be usefull to customise your installation without modifying or creating packages.
-
-Of course, as it is a bash script, you can do whatever you want with it...
-An example is given with the file `pp-template.sh`
-
-#### Available variables
-
-- **$STAGING_ROOT** : path to the root of the staging directory. It contains one folder per partition (eg. "Workbench", "Apps", etc.)
-- **$HSTA_BIN** : path to the hst-amiga executable
-- **$HST_BIN** : path to the hst-imager executable
-
-#### Availabled logging functions
-
-- log_info()
-- log_success()
-- log_error()
-- log_warn()
-
-#### Available helper functions
-
-- **enable_commodity(name)** : copy given commodity from Tools/Commodities to WBStartup
-- **enable_dosdriver(name)** : copy given dosdriver from Storage/DOSDrivers to Devs/DOSDrivers
-- **enable_monitor(name)** : copy given monitor from Storage/Monitors to Devs/Monitors
-- **set_tooltypes(icon_path, tooltypes_string)** : replace icon tooltypes with the given one
-- **use_deficon(icon_path, def_icon)** : replace (or create) given icon file with given system default 
-- **set_icon(icon_path, icon_args)** : call hst.amiga icon update on icon with given arguments
-
-
-## Creating packages
-
-The `generate_package.sh` script is the companion tool for creating the `.desc` files required by the deployment process. It automates the indexing of archives and attempts to intelligently map where files should be installed on the Amiga partitions. This provides with a simple yet efficient way to build and share reproductable installations without sharing a heavy binary image.
-
-**Key features:**
-
-- **AmigaOS 3.2 Specialized Logic**: Includes dedicated rules for processing official AmigaOS 3.2 and Update ADFs. It mimics the behavior of the original Commodore/Hyperion install scripts (e.g., remapping `Startup-HardDrive` to `S:Startup-Sequence`, copying Backdrops to Presets, etc).
-- **Generic Rule Engine**: For non-OS archives, the script applies a "best-guess" logic to place files in standard Amiga locations (e.g., `.library` to `Libs:`, `.device` to `Devs:`).
-- **Multi-Format Support**: Can parse and index `.lha`, `.zip`, `.iso` and `.adf` archives.
-- **Smart Remapping**: Automatically detects and handles compressed `.z` files inside adf, stripping the extension for the destination path.
-- **WHDload game specilized Logic**: install games in a classic tree structure `<first letter>/<game name>`, ready for GUI like `iGame`
-
-> **Note**: While the specialized OS 3.2 and whdload logics are pretty accurate, the generic output for third-party software often serves as a template and **requires manual adjustment** to ensure perfect placement.
-
-### Arguments & Options
-
-| Argument | Long Format        | Description                                                              |
-| :------- | :----------------- | :----------------------------------------------------------------------- |
-| `-l`     | `--package-list`   | **Required**. Path to the file listing packages and their sources.       |
-| `-p`     | `--packages-path`  | **Required**. Directory where the generated `.desc` files will be saved. |
-|          | `--clean-on-close` | Removes temporary downloads after the generation process.                |
-| `-h`     | `--help`           | Displays the help message.                                               |
-
-### Usage Example
-
-(re)generate descriptions files for Amiga OS 3.2 ADF files listed in packages-OS32.list
-
-```bash
-./generate_package.sh -l OS32.list -p packages/OS32/
-```
-
-For more defails on files format, please see next chapter.
-
-## Configuration Files Format
-
-The toolchain uses two types of simple text files to manage software installation.
-
-### Package list file
-
-A package list is a text file that defines **what** to install. It is a simple space-separated or tab-separated file which name ends with `.list` by convention.
-A list file must match with a corresponding package directory of the same name but **without** the `.list` extention
-
-**Format:**
-
-`PackageName` `SourcePathOrUrl`
-
-- **PackageName**: The name of the package. It must match a corresponding `.desc` file in the package descriptions directory.
-- **SourcePathOrUrl**: Can be a local path to an archive (`.lha`, `.zip`, `.iso` or `.adf`) or a direct `http/https` URL.
-- Lines starting with `#` are ignored (comments)
-- If a source path url ends with `!`, the first encoutered ADF file inside the archive will be used instead of the archive itself.
-
-By convention, contributed commercial free files are stored in the `contribs` folder and any specific archive of your own which is not publicaly downloadable goes in `custom` directory (eg. any commercial software you own).
-
->**Note**: spaces are not allowed for package name nor source path/URL
-
-**Example:**
-Local files in ADF format for Amiga OS 3.2
+The default `partitions.config` is `C:`, a single FAT16 partition using the available space. Each noncomment line has the format `LETTER:FILESYSTEM:SIZE[:boot]`. For example, three partitions with the second active:
 
 ```text
-Workbench32     AmigaOS_ADF/Workbench3.2.adf
-Extras32        AmigaOS_ADF/Extras3.2.adf
+C:fat16:128M
+D:fat16:128M:boot
+E:fat16:
 ```
 
-Third Party OS Addons
+Letters start at C and must be consecutive, up to F. They identify partitions in the configuration; DOS determines its own runtime drive letters. The optional fourth field `boot` marks the active partition; otherwise the first is active. Only one marker is allowed. The filesystem defaults to `fat16`, the only supported value. Sizes use binary `K`, `M`, or `G`; an omitted size uses remaining space and is allowed only for the last entry. For example, `C:::boot` specifies the default filesystem and remaining space with an explicit boot flag. Blank lines and comments beginning with `#` are ignored. Partition starts are aligned to 1 MiB, which may leave a small amount of disk space unused. A FAT16 partition cannot exceed 2 GiB and must contain a valid FAT16 cluster count. Unsupported layouts fail before the target is modified.
+
+The BPB hidden-sector field is set to the partition start. By default, the script uses 63 sectors per track and selects the smallest head count in `16, 32, 64, 128, 255` for which the entire disk fits in 1024 cylinders. For example, a 512 MiB image selects 32/63. This is a compatibility heuristic based on capacity, not a measurement or guarantee of target BIOS geometry; BIOS translation rules vary. A disk larger than the largest automatic profile is rejected rather than truncated.
+
+Use `--heads N --sectors N` together to override the heuristic with the **logical geometry exposed by the target BIOS**, with 1–255 heads and 1–63 sectors per track. The script displays whether the geometry was selected automatically or explicitly. The same values determine the FAT16 BPB and both MBR CHS addresses. Every partition must fit within the 1024-cylinder CHS encoding limit; an unrepresentable layout is rejected before writing. MS-DOS 6.22 uses the BPB geometry for BIOS CHS reads, so a mismatch with the BIOS logical geometry can prevent it from booting.
+
+For the 512 MiB QEMU image and translation configuration below, the logical geometry is 32/63. Verify the geometry exposed by your target BIOS before preparing a physical disk, and specify it explicitly. If the disk or intended layout exceeds BIOS-addressable capacity, use a smaller disk or a layout within that capacity; do not assume the entire device is accessible. The options do not specify the BIOS cylinder count, which may be less than 1024: a successful boot alone does not validate access to the entire FAT16 partition. Test the intended address range on the target. Changing geometry on an existing installation is not supported; prepare a new image or reinitialize the disk after backing up its contents.
+
+Run `python3 tests/test_setup_disk.py` for disposable-image tests. Most tests use an isolated `ms-sys` stand-in; an additional test validates MBR installation with the real tool when it is available.
+
+For a disposable 512 MiB QEMU test, choose a new filename: `truncate` and setup overwrite an existing image. The example uses 32/63 geometry for this QEMU translation; it is not a general physical-BIOS setting.
+
+```bash
+truncate -s 512M dos622.img
+./setup_disk.sh --disk dos622.img --heads 32 --sectors 63
+./package.sh --disk dos622.img --install dos622,benchmark
+qemu-system-i386 -machine pc -cpu 486 -m 16 \
+  -drive file=dos622.img,format=raw,if=none,id=dosdisk \
+  -device ide-hd,drive=dosdisk,bus=ide.0,unit=0,cyls=1040,heads=16,secs=63,bios-chs-trans=large \
+  -boot c
+```
+
+QEMU is optional and is not an installation dependency. The package command runs after setup and does not create or format the disk.
+
+## Configuration
+
+`main.config` is sourced by the package entry points as trusted Bash configuration. It defines only package and cache locations; it does not select a disk. Environment values take precedence over these defaults:
+
+| Setting | Default and use |
+| --- | --- |
+| `PACKAGES_BASE_DIR` | The repository's `packages` directory, resolved from the script location. Used for named `--install` packages. |
+| `TMP_DOWNLOAD_DIR` | `$XDG_CACHE_HOME/dos-bootstrap/downloads`, or `$HOME/.cache/dos-bootstrap/downloads` when `XDG_CACHE_HOME` is unset. If both are unset, `${TMPDIR:-/tmp}/dos-bootstrap-$UID/downloads` is used. |
+| `TMPDIR` | Standard environment variable for temporary work; when unset, the system temporary directory is used. It must name an existing writable directory. Temporary staging is cleaned up; the download cache persists unless `--clean-on-close` is used. |
+
+Relative overrides and local package sources are resolved from the caller's working directory; paths containing spaces are supported. When using `sudo`, environment handling and the effective user's home directory may result in a different cache. Use an explicit approved `TMP_DOWNLOAD_DIR` when sharing a cache. An explicit `--disk`, `--config`, `--package-list` or `--packages-path` controls its respective operation; configuration never supplies a target disk. Treat `main.config` as code and edit it only from trusted sources.
+
+For example, after preparing a disk, a cache path can be supplied explicitly to a root-run package installation:
+
+```bash
+sudo env TMP_DOWNLOAD_DIR="/path with spaces/cache" ./package.sh --disk /dev/sdX --install dos622
+```
+
+## Generic package workflow
+
+`generate_package.sh` creates editable `.desc` mappings; it never installs packages. `package.sh` obtains the sources, extracts all selected components, builds an isolated staging tree, optionally runs `--post-script` there, and then transfers staged files to existing FAT16 partitions. It does not initialize, repartition, or format disks. A failed transfer can leave some files updated; the script reports the failure and stops.
+
+### Package lists and sources
+
+A `.list` file contains a component name and local path or HTTP(S) URL per line. Blank lines and comments are ignored. Quote paths containing spaces:
 
 ```text
-IDEfix97        https://aminet.net/driver/media/IDEfix97.lha
-AmigaTestKit    https://github.com/keirf/amiga-stuff/releases/download/testkit-v1.21/AmigaTestKit-1.21.zip
-MUI5            https://github.com/amiga-mui/muidev/releases/download/MUI-5.0-20210831/MUI-5.0-20210831-os3.lha
+editor   custom/editor.zip
+tools    "custom/DOS utilities"
+utility  https://example.org/utility.zip
 ```
 
-### Package Description
+ZIP files, FAT12 floppy images (`.img` and `.ima`), ordinary files and local directories are supported. FAT12 images are read with mtools without mounting; hidden and system files are included. The source must be an unpartitioned FAT12 image with 512-byte sectors and a valid BPB. HTTP(S) files are downloaded with `wget` and cached under `TMP_DOWNLOAD_DIR`; `--clean-on-close` removes the selected downloaded files. A failed download or extraction stops the operation. Cached files are keyed by URL, but are not authenticated by checksums. ADF and LHA are Amiga formats and are not supported; ISO and non-FAT12 disk-image extraction are not implemented.
 
-A description file defines **where** to copy the files from an archive. A description file ends with `.desc`. Each package mentioned in the `.list` file **must** have a corresponding `.desc` file in the descriptions directory (e.g., `IDEfix97.desc`).
-Any file present in the archive but not listed in a ".desc" file will be ignored.
+Named sets use `packages/NAME.list` and `packages/NAME/`; select one or more in order with `--install NAME[,NAME...]`. Alternatively provide a list and description directory explicitly.
 
-**Format:**
+### Generate and edit descriptions
 
-`"SourcePathInArchive"` `"AmigaDestination"`
+```bash
+./generate_package.sh --package-list mypackages.list --packages-path packages/mypackages
+```
 
-- **SourcePathInArchive**: The internal path of the file or directory inside the archive.
-- **AmigaDestination**: The destination path on the Amiga, formatted as `Volume:Path/To/Target`.
-- **Encapsulation**: It is highly recommended to wrap both paths in **double quotes** `"` to handle spaces and special characters.
-
-**Key Features:**
-
-- **Path Sanitization**: The script automatically removes trailing slashes and redundant quotes to prevent "directory-in-directory" nesting errors.
-- **Automatic Decompression**: Files ending in `.z` or `.Z` (common in AmigaOS updates) are automatically decompressed using `gunzip` during the staging process.
-- **Recursive Copy**: If the source path is a directory (ends with `/`), its entire content is merged into the destination (that must also ends with `/`).
-- **Ordering**: Files are processed in the order they appear in the `.desc` file.
-
-**Example (`SysInfo.desc`):**
+For each entry the generator inspects its ZIP or directory and writes `component.desc` with one mapping per file, initially under `C:component/`. Existing descriptions of the same name are overwritten. Review and edit the generated mappings:
 
 ```text
-"SysInfo"       "Workbench:Tools/SysInfo"
-"SysInfo.info"  "Workbench:Tools/SysInfo.info"
-"Docs/"         "Workbench:Docs/"
+"README.TXT"       "C:TOOLS/README.TXT"
+"BIN/EDITOR.EXE"   "D:APPS/EDITOR.EXE"
+"DOCS/"            "C:TOOLS/DOCS/"
 ```
 
-Please read the [Packages Reference](PackageReference.md) before sending new ones
+Each line is a source path within the extracted component and a logical-volume destination. A directory mapping copies its contents recursively to the named destination. Paths are parsed as quoted text, not executed as shell commands. Absolute paths, `..`, symlinks, unsupported FAT characters and malformed mappings are rejected. Later components replace matching staged files, case-insensitively. File names can use FAT long names; MS-DOS 6.22 may expose their short aliases instead.
+
+During staging, files with the Microsoft KWAJ signature are expanded using the host's `libmspack` shared library before later components and `--post-script` run. KWAJ methods 0–3 with a recorded uncompressed length are supported. Detection uses the file signature; an ordinary file ending in `_` is copied unchanged. Since KWAJ files do not always record the original filename, the description must specify it explicitly, for example:
+
+```text
+"EMM386.EX_" "C:DOS/EMM386.EXE"
+```
+
+An unresolved destination ending in `_`, an unsupported KWAJ method or missing length, an SZDD file, or decompression failure stops installation before target transfer. Directory mappings containing compressed files therefore need explicit file mappings when their destination names must change. Expanded files replace their staged destinations; compressed copies are not staged. Existing compressed files from a previous installation are not removed from the target.
+
+### Install packages
+
+`package.sh` installs packages onto an existing whole RAW image or physical disk. It does not create images, partition disks or format filesystems. Its options are:
+
+| Option | Meaning |
+| --- | --- |
+| `-d`, `--disk PATH` | Required target whole disk or RAW image. |
+| `-i`, `--install NAME[,NAME...]` | Install named packages in the supplied order. |
+| `-l`, `--package-list FILE` | Use a specific component list. |
+| `-p`, `--packages-path DIR` | Use its description directory; required with `--package-list`. |
+| `-c`, `--config FILE` | Partition configuration; defaults to the repository's `partitions.config`. |
+| `-s`, `--post-script FILE` | Source a trusted script after staging and before transfer. |
+| `--clean-on-close` | Remove selected downloaded cache files after successful installation. |
+| `-h`, `--help` | Show usage. |
+
+`--install` cannot be combined with `--package-list` or `--packages-path`. A named package is resolved using `PACKAGES_BASE_DIR` in `main.config`.
+
+```bash
+# RAW image initialized with setup_disk.sh:
+./package.sh --disk disk.img --config partitions.config \
+  --package-list mypackages.list --packages-path packages/mypackages
+
+# An initialized physical whole disk (requires access to the device):
+sudo ./package.sh --disk /dev/sdX --config partitions.config --install mypackages
+```
+
+The partition configuration must match the target's partition count, start positions and sizes. `C:` and `D:` are logical identifiers assigned by that configuration, not guarantees of DOS drive-letter assignment. The installer checks the MBR and FAT16 metadata, refuses mounted or held physical devices and loop-attached images, and uses mtools with byte offsets to access the whole image or disk. `mcopy`, `mdir`, `mmd` and `mattrib` from mtools, Python 3, `wget`, the `libmspack` runtime library, and the Linux device-inspection tools must be installed on the host. The installer checks for libmspack before staging. Existing unrelated target files are retained; matching files are replaced. Existing targets with names that mtools cannot safely replace cause a failure.
+
+Use `--post-script ./customize.sh` to source a user-supplied Bash script after staging and before transfer. Its working directory is `$STAGING_ROOT`, with one directory per selected logical volume (for example `C` and `D`). Logging functions are available. The script is trusted code; [pp-template.sh](pp-template.sh) is an example, not an automatic hook. A failing script or invalid staged path prevents transfer.
+
+Ordinary packages do not modify a DOS boot sector. FAT source attributes are not generally preserved; the `dos622` installation below explicitly sets its required system-file attributes. Raw-image tests require mtools and can be run with `python3 tests/test_packages.py` and `python3 tests/test_dos622_boot.py`. Physical-device handling and booting require separate hardware validation.
+
+### MS-DOS 6.22 installation
+
+`--install dos622` obtains the three floppy images specified in `packages/dos622.list`. Its default sources are archive.org URLs, downloaded through the package cache. To use local original media instead, replace the URLs with local image paths while retaining the component names. Relative source paths are resolved from the current working directory. Users are responsible for having appropriate rights to use the media; hosting at archive.org does not grant those rights. The images and Microsoft binaries are not included in the repository.
+
+For example, local copies can be listed as:
+
+```text
+Dos622-Disk1 media/dos-622-disk1.img
+Dos622-Disk2 media/dos-622-disk2.img
+Dos622-Disk3 media/dos-622-disk3.img
+```
+
+The installer recognizes the DOS-specific boot operation by the list filename `dos622.list` and the `Dos622-Disk1` component name, including when an explicit `--package-list` is used.
+
+The individual `Dos622-Disk1`, `Dos622-Disk2` and `Dos622-Disk3` descriptions place `IO.SYS`, `MSDOS.SYS` and `COMMAND.COM` in the C: root, and the remaining files in `C:\\DOS`.
+
+The 86 KWAJ-compressed files, including `HIMEM.SY_`, `EMM386.EX_`, `XCOPY.EX_` and `EDIT.HL_`, are expanded to their usable names using mappings from the media's `PACKING.LST`. The included DOS `EXPAND.EXE` is not executed.
+
+The target must use the matching `partitions.config`, have C: as its only active partition, and have BIOS drive number `0x80` in its BPB.
+
+The `dos622` package uses the original Microsoft MS-DOS 6.22 VBR. At installation time it validates the 1.44 MB disk-1 FAT12 image, its boot-code fingerprint and the three original system files. It takes the entry jump and boot-code bytes `0x3e–0x1fd` from that floppy and combines them with the target FAT16 BPB and extended BPB at bytes `0x03–0x3d`, retaining the target signature. The same code region was observed in a working hard-disk VBR. The supported source is the verified Microsoft 6.22 disk-1 variant; other DOS versions, OEM variants and directory-only sources are rejected.
+
+No precompiled Microsoft VBR is shipped or needed in `contribs/`: it is extracted from the source media at runtime. No external binary currently needs to be downloaded or built into `contribs/`; an older local `contribs/` cache may contain unused historical material and is not part of the installation. [ms-sys](https://ms-sys.sourceforge.net/) is a GPL host tool; it provides the selected Syslinux MBR, while rights in other boot-record bytes it supplies should be assessed separately. [libmspack](https://github.com/kyz/libmspack) is an LGPL library used for decompression. mtools and all other host programs have their own licenses. Microsoft boot code and system files are not bundled; use of source media is subject to its applicable rights and licensing.
+
+The package installs `IO.SYS` and `MSDOS.SYS` in the first two root-directory entries, applies their read-only, hidden and system attributes, and checks file contents, FAT chains and the first three contiguous `IO.SYS` sectors. It rejects occupied first entries and incompatible existing system files without relocating unrelated files. Only after other staged files are transferred does it install and verify the native VBR, preserving the target BPB, geometry, volume metadata and signature. `DRVSPACE.BIN` remains in `C:\\DOS`; the package does not attempt to duplicate every detail of `SYS C:`.
+
+Existing unrelated files are retained. Existing system files are accepted for reinstall only when all three already match and satisfy the boot checks; incomplete or incompatible existing files are rejected. A failed file transfer can leave some files updated but does not install a new VBR. If the VBR write fails, the installer attempts to restore and verify the original sector.
+
+The BPB geometry and drive assumptions must match the real BIOS. Native boot has been tested in QEMU and on one physical system; other BIOS and storage combinations require their own validation. The package does not configure the DOS environment or run Microsoft Setup, and placing the supplied files is not a substitute for validating a complete installation.
+
+### Benchmark pack
+
+`--install benchmark` downloads Phil's DOS Benchmark Pack v1.6 and installs its directory tree under `C:\\BENCH`. From that directory, `DOSBENCH.BAT` offers its menu, including TOPBENCH, CACHECHK, SpeedSys, 3DBench, Landmark and other included tools. Some tools have hardware or memory requirements beyond a particular configuration. The pack's binaries are not bundled in this repository; the pack and its components have their own licensing terms.
+
+## Testing and troubleshooting
+
+Run `python3 -m unittest discover -s tests` for the automated suite. Tests use disposable RAW images; QEMU checks are skipped if it is unavailable, and tests using original media are skipped if that media is unavailable. See [diagnostics/README.md](diagnostics/README.md) for separate boot diagnostics, their destructive effects and recovery procedures. QEMU is optional and is not an installation dependency.

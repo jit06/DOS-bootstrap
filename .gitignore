@@ -1,0 +1,15 @@
+# User-supplied media, disk images and external binary downloads.
+/media/
+/contribs/
+*.qcow2
+*.vhd
+*.vhdx
+*.iso
+*.bin
+*.zip
+*.log
+*.tmp
+*.bak
+/benchmark-results/
+/benchmarks-output/
+__pycache__/
